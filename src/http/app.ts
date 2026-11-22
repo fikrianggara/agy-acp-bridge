@@ -2,17 +2,25 @@ import { Hono } from "hono";
 import { Config } from "../config.js";
 import { Connection } from "../acp/connection.js";
 import { ModelService, createModelsRouter } from "./models.js";
-import { createChatRouter } from "./chat.js";
+import { createChatRouter, createSessionsRouter } from "./chat.js";
+import { SessionStore } from "../sessions/store.js";
+import { KeyedLock } from "../sessions/lock.js";
 
 export interface AppContext {
   config: Config;
   connection: Connection;
   modelService: ModelService;
+  sessionStore?: SessionStore;
+  lock?: KeyedLock;
   isReady?: () => boolean;
 }
 
 export function createApp(ctx: AppContext): Hono {
   const app = new Hono();
+  const sessionStore =
+    ctx.sessionStore ??
+    new SessionStore(ctx.config.sessionTtlMs, ctx.config.maxSessions);
+  const lock = ctx.lock ?? new KeyedLock();
 
   // Liveness probe (no auth)
   app.get("/healthz", (c) => {
@@ -60,12 +68,21 @@ export function createApp(ctx: AppContext): Hono {
     return next();
   });
 
-  // Mount models and chat routes under /v1
+  // Mount models, chat, and session routes under /v1
   const modelsRouter = createModelsRouter(ctx.modelService);
   app.route("/v1", modelsRouter);
 
-  const chatRouter = createChatRouter(ctx.connection, ctx.modelService, ctx.config);
+  const chatRouter = createChatRouter(
+    ctx.connection,
+    ctx.modelService,
+    ctx.config,
+    sessionStore,
+    lock
+  );
   app.route("/v1", chatRouter);
+
+  const sessionsRouter = createSessionsRouter(sessionStore, ctx.connection);
+  app.route("/v1", sessionsRouter);
 
   return app;
 }

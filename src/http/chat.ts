@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import crypto from "node:crypto";
 import { Connection } from "../acp/connection.js";
 import { Config } from "../config.js";
 import { ModelService } from "./models.js";
@@ -10,11 +11,24 @@ import {
 } from "../mapping/request.js";
 import { mapFinishReason } from "../mapping/finish.js";
 import { handleStreamCompletion } from "./sse.js";
+import {
+  SessionStore,
+  computeKey,
+  Conversation,
+} from "../sessions/store.js";
+import {
+  reconcile,
+  computeMessagesDigest,
+  computeSystemHash,
+} from "../sessions/reconcile.js";
+import { KeyedLock } from "../sessions/lock.js";
 
 export function createChatRouter(
   connection: Connection,
   modelService: ModelService,
-  config: Config
+  config: Config,
+  sessionStore: SessionStore,
+  lock: KeyedLock
 ): Hono {
   const router = new Hono();
 
@@ -79,7 +93,7 @@ export function createChatRouter(
       }
     }
 
-    // Get models to validate model
+    // Validate Model
     const availableModels = await modelService.getModels();
     const isModelValid = availableModels.some((m) => m.id === req.model);
     if (!isModelValid) {
@@ -94,138 +108,274 @@ export function createChatRouter(
       );
     }
 
-    // Create a new session or load
-    const session = await connection.newSession({ cwd });
+    // Determine principal and conversation ID
+    const principalId = "default";
+    let conversationId = c.req.header("x-acp-conversation") || req.user;
+    if (!conversationId) {
+      // Fallback: sha256 hash of first message
+      const firstMsg = req.messages[0];
+      conversationId = crypto
+        .createHash("sha256")
+        .update(`${firstMsg.role}:${stringifyMessageContent(firstMsg.content)}`)
+        .digest("hex");
+    }
 
-    // Validate and set model
-    await connection.setConfigOption(session.sessionId, "model", req.model);
+    const key = computeKey(principalId, conversationId);
 
-    // Validate and set thought level if header present
-    const thoughtHeader = c.req.header("x-acp-thought-level");
-    if (thoughtHeader) {
-      const thoughtOpt = session.configOptions.find(
-        (o) => o.category === "thought_level"
-      );
-      const validValues = thoughtOpt?.options.map((o) => o.value) ?? [];
-      if (!validValues.includes(thoughtHeader)) {
-        await connection.closeSession(session.sessionId).catch(() => {});
-        return c.json(
-          {
-            error: {
-              message: `Unsupported thought level '${thoughtHeader}'. Valid options: ${validValues.join(", ")}`,
-              type: "unsupported_option",
-            },
+    // Acquire lock
+    if (!lock.tryAcquire(key)) {
+      return c.json(
+        {
+          error: {
+            message: "Session is busy with another turn",
+            type: "session_busy",
           },
-          400
-        );
-      }
-      await connection.setConfigOption(
-        session.sessionId,
-        "thought_level",
-        thoughtHeader
+        },
+        409
       );
     }
 
-    // Validate and set mode if header present
-    const modeHeader = c.req.header("x-acp-mode");
-    if (modeHeader) {
-      await connection.setConfigOption(session.sessionId, "mode", modeHeader);
-    }
+    try {
+      const existingConv = sessionStore.get(key);
 
-    // Extract system messages for prefix context injection (memory & skills)
-    const systemMessages = req.messages.filter((m) => m.role === "system");
-    const nonSystemMessages = req.messages.filter((m) => m.role !== "system");
+      // Reconcile
+      let rec;
+      try {
+        rec = reconcile(existingConv, req.messages, req.model);
+      } catch (err: any) {
+        if (err.name === "SessionBusyError") {
+          return c.json(
+            {
+              error: {
+                message: "Session is busy with another turn",
+                type: "session_busy",
+              },
+            },
+            409
+          );
+        }
+        throw err;
+      }
 
-    const systemPrefix = formatSystemContext(systemMessages);
+      let acpSessionId: string;
+      let promptText: string;
 
-    // Construct prompt text
-    let promptText = "";
-    if (nonSystemMessages.length === 1) {
-      const userMsg = nonSystemMessages[0];
-      promptText = systemPrefix + stringifyMessageContent(userMsg.content);
-    } else {
-      // Multiple messages or replay
-      const historyLines = nonSystemMessages.slice(0, -1).map((m) => {
-        return `${m.role.toUpperCase()}:\n${stringifyMessageContent(m.content)}`;
-      });
-      const lastMsg = nonSystemMessages[nonSystemMessages.length - 1];
-      promptText = [
-        systemPrefix,
-        "[Conversation History]",
-        ...historyLines,
-        "[End Conversation History]",
-        "",
-        stringifyMessageContent(lastMsg.content),
-      ].join("\n");
-    }
+      if (rec.kind === "delta" && existingConv) {
+        // FAST PATH: Re-use existing ACP session
+        acpSessionId = existingConv.acpSessionId;
+        promptText = rec.promptText;
+      } else {
+        // FULL REPLAY / NEW SESSION
+        if (existingConv?.acpSessionId) {
+          connection.closeSession(existingConv.acpSessionId).catch(() => {});
+        }
 
-    // Warnings header
-    const warnings = getUnsupportedWarnings(req);
-    if (warnings.length > 0) {
-      c.header("x-acp-warnings", warnings.join(", "));
-    }
-    c.header("x-acp-session-id", session.sessionId);
+        const session = await connection.newSession({ cwd });
+        acpSessionId = session.sessionId;
 
-    // If stream = true
-    if (req.stream) {
-      return handleStreamCompletion(c, {
-        connection,
-        sessionId: session.sessionId,
-        model: req.model,
-        promptText,
-        includeUsage: req.stream_options?.include_usage ?? false,
-        exposeThoughts: config.exposeThoughts,
-        onEnd: async () => {
-          await connection.closeSession(session.sessionId).catch(() => {});
-        },
-      });
-    }
+        // Set model
+        await connection.setConfigOption(acpSessionId, "model", req.model);
 
-    // If stream = false (non-stream)
-    const textChunks: string[] = [];
-    const promptRes = await connection.prompt(
-      session.sessionId,
-      promptText,
-      (chunk) => {
-        if (chunk.type === "text") {
-          textChunks.push(chunk.text);
+        // Thought level
+        const thoughtHeader = c.req.header("x-acp-thought-level");
+        if (thoughtHeader) {
+          const thoughtOpt = session.configOptions.find(
+            (o) => o.category === "thought_level"
+          );
+          const validValues = thoughtOpt?.options.map((o) => o.value) ?? [];
+          if (!validValues.includes(thoughtHeader)) {
+            await connection.closeSession(acpSessionId).catch(() => {});
+            return c.json(
+              {
+                error: {
+                  message: `Unsupported thought level '${thoughtHeader}'. Valid options: ${validValues.join(", ")}`,
+                  type: "unsupported_option",
+                },
+              },
+              400
+            );
+          }
+          await connection.setConfigOption(
+            acpSessionId,
+            "thought_level",
+            thoughtHeader
+          );
+        }
+
+        // Mode
+        const modeHeader = c.req.header("x-acp-mode");
+        if (modeHeader) {
+          await connection.setConfigOption(acpSessionId, "mode", modeHeader);
+        }
+
+        // Format prompt with prefix context (memory & skills)
+        const systemMessages = req.messages.filter((m) => m.role === "system");
+        const nonSystemMessages = req.messages.filter((m) => m.role !== "system");
+        const systemPrefix = formatSystemContext(systemMessages);
+
+        if (nonSystemMessages.length <= 1) {
+          const lastMsg = nonSystemMessages[0] || { content: "" };
+          promptText = systemPrefix + stringifyMessageContent(lastMsg.content);
+        } else {
+          const historyLines = nonSystemMessages.slice(0, -1).map((m) => {
+            return `${m.role.toUpperCase()}:\n${stringifyMessageContent(m.content)}`;
+          });
+          const lastMsg = nonSystemMessages[nonSystemMessages.length - 1];
+          promptText = [
+            systemPrefix,
+            "[Conversation History]",
+            ...historyLines,
+            "[End Conversation History]",
+            "",
+            stringifyMessageContent(lastMsg.content),
+          ].join("\n");
         }
       }
-    );
 
-    // Close session for non-long-lived request in Task 5 (long-lived managed by session store in Task 8)
-    await connection.closeSession(session.sessionId).catch(() => {});
+      // Add headers
+      const warnings = getUnsupportedWarnings(req);
+      if (warnings.length > 0) {
+        c.header("x-acp-warnings", warnings.join(", "));
+      }
+      c.header("x-acp-session-id", acpSessionId);
 
-    const content = textChunks.join("");
-    const finishReason = mapFinishReason(promptRes.stopReason);
+      // Track turn state
+      const turnId = `turn-${Date.now()}`;
+      const activeTurnState = { turnId, startedAt: Date.now() };
 
-    return c.json({
-      id: `chatcmpl-${session.sessionId}`,
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model: req.model,
-      choices: [
-        {
-          index: 0,
-          message: {
-            role: "assistant",
-            content,
+      const currentConv: Conversation = {
+        key,
+        principalId,
+        conversationId,
+        acpSessionId,
+        cwd,
+        model: req.model,
+        systemHash: computeSystemHash(req.messages),
+        messagesDigest: computeMessagesDigest(req.messages),
+        messagesCount: req.messages.length,
+        lastAssistantText: existingConv?.lastAssistantText || "",
+        createdAt: existingConv?.createdAt || Date.now(),
+        lastUsedAt: Date.now(),
+        activeTurn: activeTurnState,
+      };
+      sessionStore.set(currentConv);
+
+      const finalizeSession = (assistantText: string) => {
+        const stored = sessionStore.get(key);
+        if (stored) {
+          stored.lastAssistantText = assistantText;
+          stored.lastUsedAt = Date.now();
+          stored.activeTurn = null;
+          stored.messagesCount = req.messages.length;
+          stored.messagesDigest = computeMessagesDigest(req.messages);
+          sessionStore.set(stored);
+        }
+      };
+
+      // Stream handling
+      if (req.stream) {
+        let streamAssistantText = "";
+        return handleStreamCompletion(c, {
+          connection,
+          sessionId: acpSessionId,
+          model: req.model,
+          promptText,
+          includeUsage: req.stream_options?.include_usage ?? false,
+          exposeThoughts: config.exposeThoughts,
+          onEnd: () => {
+            finalizeSession(streamAssistantText);
+            lock.release(key);
           },
-          finish_reason: finishReason,
-        },
-      ],
-      usage: promptRes.usage
-        ? {
-            prompt_tokens: promptRes.usage.inputTokens,
-            completion_tokens: promptRes.usage.outputTokens,
-            total_tokens: promptRes.usage.totalTokens,
+        });
+      }
+
+      // Non-stream handling
+      const textChunks: string[] = [];
+      const promptRes = await connection.prompt(
+        acpSessionId,
+        promptText,
+        (chunk) => {
+          if (chunk.type === "text") {
+            textChunks.push(chunk.text);
           }
-        : {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
+        }
+      );
+
+      const content = textChunks.join("");
+      finalizeSession(content);
+
+      const finishReason = mapFinishReason(promptRes.stopReason);
+
+      return c.json({
+        id: `chatcmpl-${acpSessionId}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: req.model,
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content,
+            },
+            finish_reason: finishReason,
           },
+        ],
+        usage: promptRes.usage
+          ? {
+              prompt_tokens: promptRes.usage.inputTokens,
+              completion_tokens: promptRes.usage.outputTokens,
+              total_tokens: promptRes.usage.totalTokens,
+            }
+          : {
+              prompt_tokens: 0,
+              completion_tokens: 0,
+              total_tokens: 0,
+            },
+      });
+    } finally {
+      // For non-stream, lock is released immediately here.
+      // For stream, lock is released in onEnd handler.
+      if (!req.stream) {
+        lock.release(key);
+      }
+    }
+  });
+
+  return router;
+}
+
+export function createSessionsRouter(
+  sessionStore: SessionStore,
+  connection: Connection
+): Hono {
+  const router = new Hono();
+
+  router.get("/sessions", (c) => {
+    const principalId = "default";
+    const sessions = sessionStore.getAllForPrincipal(principalId);
+    return c.json({
+      data: sessions.map((s) => ({
+        key: s.key,
+        conversationId: s.conversationId,
+        acpSessionId: s.acpSessionId,
+        model: s.model,
+        messagesCount: s.messagesCount,
+        lastUsedAt: s.lastUsedAt,
+        isActive: s.activeTurn !== null,
+      })),
     });
+  });
+
+  router.delete("/sessions/:key", async (c) => {
+    const key = c.req.param("key");
+    const conv = sessionStore.get(key);
+    if (!conv) {
+      return c.json({ error: { message: "Session not found", type: "not_found" } }, 404);
+    }
+    await connection.closeSession(conv.acpSessionId).catch(() => {});
+    sessionStore.delete(key);
+    return c.json({ success: true, message: `Session ${key} closed and deleted` });
   });
 
   return router;
