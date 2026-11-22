@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { Config } from "../config.js";
 import { Connection } from "../acp/connection.js";
 import { ModelService, createModelsRouter } from "./models.js";
+import { createChatRouter } from "./chat.js";
 
 export interface AppContext {
   config: Config;
@@ -59,9 +60,12 @@ export function createApp(ctx: AppContext): Hono {
     return next();
   });
 
-  // Mount models route under /v1
+  // Mount models and chat routes under /v1
   const modelsRouter = createModelsRouter(ctx.modelService);
   app.route("/v1", modelsRouter);
+
+  const chatRouter = createChatRouter(ctx.connection, ctx.modelService, ctx.config);
+  app.route("/v1", chatRouter);
 
   return app;
 }
