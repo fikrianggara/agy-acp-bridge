@@ -1,7 +1,18 @@
+export type OpenAIToolCallDelta = {
+  index: number;
+  id?: string;
+  type?: "function";
+  function?: {
+    name?: string;
+    arguments?: string;
+  };
+};
+
 export type OpenAIChunkDelta = {
   role?: string;
   content?: string;
   reasoning_content?: string;
+  tool_calls?: OpenAIToolCallDelta[];
 };
 
 export type OpenAIUsage = {

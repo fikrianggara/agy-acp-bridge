@@ -5,6 +5,7 @@ import { ModelService, createModelsRouter } from "./models.js";
 import { createChatRouter, createSessionsRouter } from "./chat.js";
 import { SessionStore } from "../sessions/store.js";
 import { KeyedLock } from "../sessions/lock.js";
+import { McpBridgeServer } from "../mcp/server.js";
 
 export interface AppContext {
   config: Config;
@@ -13,6 +14,7 @@ export interface AppContext {
   sessionStore?: SessionStore;
   lock?: KeyedLock;
   isReady?: () => boolean;
+  mcpServer?: McpBridgeServer;
 }
 
 export function createApp(ctx: AppContext): Hono {
@@ -77,7 +79,8 @@ export function createApp(ctx: AppContext): Hono {
     ctx.modelService,
     ctx.config,
     sessionStore,
-    lock
+    lock,
+    ctx.mcpServer
   );
   app.route("/v1", chatRouter);
 

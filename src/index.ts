@@ -6,6 +6,7 @@ import { ModelService } from "./http/models.js";
 import { SessionStore } from "./sessions/store.js";
 import { KeyedLock } from "./sessions/lock.js";
 import { createApp } from "./http/app.js";
+import { McpBridgeServer } from "./mcp/server.js";
 
 async function main() {
   const config = loadEnvConfig();
@@ -20,8 +21,13 @@ async function main() {
     process.exit(1);
   }
 
-  // 2. Start ACP Supervisor
-  const supervisor = new Supervisor(config);
+  // 2. Start MCP Bridge Server for IDE tools
+  const mcpServer = new McpBridgeServer();
+  const mcpPort = await mcpServer.start(0);
+  console.info(`[BOOT] Started MCP bridge TCP server on port ${mcpPort}`);
+
+  // 3. Start ACP Supervisor
+  const supervisor = new Supervisor(config, config.agyBin, ["acp"], mcpServer);
   try {
     console.info(`[BOOT] Initializing Antigravity ACP child process (${config.agyBin} acp)...`);
     await supervisor.start();
@@ -47,6 +53,7 @@ async function main() {
     sessionStore,
     lock,
     isReady: () => supervisor.isReady(),
+    mcpServer,
   });
 
   const server = serve({
@@ -61,6 +68,7 @@ async function main() {
     console.info(`[SHUTDOWN] Received ${signal}, closing server and child process...`);
     server.close();
     await supervisor.shutdown();
+    await mcpServer.close();
     console.info("[SHUTDOWN] Shutdown complete.");
     process.exit(0);
   };

@@ -8,6 +8,7 @@ import {
   getUnsupportedWarnings,
   formatSystemContext,
   stringifyMessageContent,
+  OpenAITool,
 } from "../mapping/request.js";
 import { mapFinishReason } from "../mapping/finish.js";
 import { handleStreamCompletion } from "./sse.js";
@@ -22,13 +23,15 @@ import {
   computeSystemHash,
 } from "../sessions/reconcile.js";
 import { KeyedLock } from "../sessions/lock.js";
+import { McpBridgeServer, PendingToolCallEvent } from "../mcp/server.js";
 
 export function createChatRouter(
   connection: Connection,
   modelService: ModelService,
   config: Config,
   sessionStore: SessionStore,
-  lock: KeyedLock
+  lock: KeyedLock,
+  mcpServer?: McpBridgeServer
 ): Hono {
   const router = new Hono();
 
@@ -232,8 +235,26 @@ export function createChatRouter(
         }
       }
 
+      // Register tools if provided
+      if (req.tools && req.tools.length > 0 && mcpServer) {
+        mcpServer.setSessionTools(acpSessionId, req.tools as OpenAITool[]);
+        mcpServer.setDefaultTools(req.tools as OpenAITool[]);
+      }
+
+      // Check if fulfilling a tool continuation
+      const lastMsg = req.messages[req.messages.length - 1];
+      const isToolResolution = lastMsg?.role === "tool" && lastMsg.tool_call_id && mcpServer;
+      const activeContinuation = isToolResolution ? mcpServer?.continuationStore.get(lastMsg.tool_call_id!) : undefined;
+
+      if (activeContinuation) {
+        activeContinuation.resolve({
+          content: [{ type: "text", text: String(lastMsg.content || "") }],
+        });
+        mcpServer?.continuationStore.delete(lastMsg.tool_call_id!);
+      }
+
       // Add headers
-      const warnings = getUnsupportedWarnings(req);
+      const warnings = getUnsupportedWarnings(req, { mcpBridgeEnabled: !!mcpServer });
       if (warnings.length > 0) {
         c.header("x-acp-warnings", warnings.join(", "));
       }
@@ -282,6 +303,8 @@ export function createChatRouter(
           promptText,
           includeUsage: req.stream_options?.include_usage ?? false,
           exposeThoughts: config.exposeThoughts,
+          mcpServer,
+          continuation: activeContinuation,
           onEnd: () => {
             finalizeSession(streamAssistantText);
             lock.release(key);
@@ -290,21 +313,94 @@ export function createChatRouter(
       }
 
       // Non-stream handling
-      const textChunks: string[] = [];
-      const promptRes = await connection.prompt(
-        acpSessionId,
-        promptText,
-        (chunk) => {
-          if (chunk.type === "text") {
-            textChunks.push(chunk.text);
-          }
+      const interceptedToolCallRef: { current: PendingToolCallEvent | null } = {
+        current: null,
+      };
+      let toolCallResolver: (() => void) | null = null;
+      const toolCallPromise = new Promise<void>((resolve) => {
+        toolCallResolver = resolve;
+      });
+
+      const onToolCall = (event: PendingToolCallEvent) => {
+        if (event.sessionId === acpSessionId || event.sessionId === "default") {
+          interceptedToolCallRef.current = event;
+          toolCallResolver?.();
         }
-      );
+      };
 
-      const content = textChunks.join("");
-      finalizeSession(content);
+      if (mcpServer) {
+        mcpServer.on("tool_call", onToolCall);
+      }
 
+      const textChunks: string[] = [];
+      const chunkCollector = (chunk: any) => {
+        if (chunk.type === "text") {
+          textChunks.push(chunk.text);
+        }
+      };
+
+      let promptPromise: Promise<any>;
+      if (activeContinuation?.promptPromise) {
+        (connection as any).activeStreams.set(acpSessionId, chunkCollector);
+        promptPromise = activeContinuation.promptPromise;
+      } else {
+        promptPromise = connection.prompt(acpSessionId, promptText, chunkCollector);
+      }
+
+      const raceResult = await Promise.race([
+        promptPromise.then((res) => ({ type: "prompt" as const, res })),
+        toolCallPromise.then(() => ({ type: "tool" as const })),
+      ]);
+
+      if (mcpServer) {
+        mcpServer.off("tool_call", onToolCall);
+      }
+
+      const toolCall = interceptedToolCallRef.current;
+      if (raceResult.type === "tool" && toolCall) {
+        const continuation = mcpServer?.continuationStore.get(toolCall.callId);
+        if (continuation) {
+          continuation.promptPromise = promptPromise;
+        }
+
+        return c.json({
+          id: `chatcmpl-${acpSessionId}`,
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model: req.model,
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: "assistant",
+                content: textChunks.length > 0 ? textChunks.join("") : null,
+                tool_calls: [
+                  {
+                    id: toolCall.callId,
+                    type: "function",
+                    function: {
+                      name: toolCall.toolName,
+                      arguments: JSON.stringify(toolCall.arguments),
+                    },
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        });
+      }
+
+      const promptRes = (raceResult as any).res;
+      let content = textChunks.join("");
       const finishReason = mapFinishReason(promptRes.stopReason);
+
+      if (!content && (promptRes.stopReason === "cancelled" || promptRes.stopReason === "refusal")) {
+        c.header("x-acp-warnings", "tool_permission_denied");
+        content = `[Action cancelled: Agent tool execution was denied under bridge permission policy '${config.permissionPolicy}'].`;
+      }
+
+      finalizeSession(content);
 
       return c.json({
         id: `chatcmpl-${acpSessionId}`,

@@ -10,6 +10,17 @@ export const OpenAIMessageSchema = z.object({
 
 export type OpenAIMessage = z.infer<typeof OpenAIMessageSchema>;
 
+export const OpenAIToolSchema = z.object({
+  type: z.literal("function").default("function"),
+  function: z.object({
+    name: z.string(),
+    description: z.string().optional(),
+    parameters: z.record(z.unknown()).optional(),
+  }),
+});
+
+export type OpenAITool = z.infer<typeof OpenAIToolSchema>;
+
 export const ChatCompletionRequestSchema = z.object({
   messages: z.array(OpenAIMessageSchema).min(1),
   model: z.string(),
@@ -20,7 +31,7 @@ export const ChatCompletionRequestSchema = z.object({
     })
     .optional(),
   user: z.string().optional(),
-  tools: z.array(z.unknown()).optional(),
+  tools: z.array(OpenAIToolSchema).optional(),
   tool_choice: z.unknown().optional(),
   temperature: z.number().optional(),
   top_p: z.number().optional(),
@@ -31,13 +42,18 @@ export const ChatCompletionRequestSchema = z.object({
 
 export type ChatCompletionRequest = z.infer<typeof ChatCompletionRequestSchema>;
 
-export function getUnsupportedWarnings(req: ChatCompletionRequest): string[] {
+export function getUnsupportedWarnings(
+  req: ChatCompletionRequest,
+  options?: { mcpBridgeEnabled?: boolean }
+): string[] {
   const warnings: string[] = [];
   if (req.temperature !== undefined) warnings.push("temperature");
   if (req.top_p !== undefined) warnings.push("top_p");
   if (req.max_tokens !== undefined) warnings.push("max_tokens");
   if (req.stop !== undefined) warnings.push("stop");
-  if (req.tools && req.tools.length > 0) warnings.push("tools_ignored");
+  if (!options?.mcpBridgeEnabled && req.tools && req.tools.length > 0) {
+    warnings.push("tools_ignored");
+  }
   return warnings;
 }
 

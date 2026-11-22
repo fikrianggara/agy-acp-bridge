@@ -14,6 +14,7 @@ It allows any OpenAI-compatible harness, tool, or agent (OpenBot, LangChain, Lla
 - **Audit-Logged Permissions:** Intercepts agent tool-call permissions (`session/request_permission`) and enforces `deny` (default), `allow-reads`, or `allow-all` policies with complete audit logging.
 - **Prefix Context Injection:** Injects user memories, system rules, and custom skill instructions from `role: "system"` messages into the agent's turn-1 prompt.
 - **OpenAI Streaming (SSE):** Full Server-Sent Events output with `role`, `content`, `finish_reason`, `usage`, and optional reasoning thoughts (`agent_thought_chunk`).
+- **Tool Bridging via MCP (Task 15):** Exposes caller-defined OpenAI `tools` to the Antigravity agent over an ephemeral TCP MCP bridge (`--ide-mcp-port`). Turns pause on tool invocations and resume seamlessly when tool results are posted.
 
 ---
 
@@ -109,6 +110,19 @@ When the agent attempts to run tools (read files, execute shell, edit files):
 - `allow-all`: All actions approved once. Recommended only with `agy acp --sandbox`.
 
 All permission requests are logged to the audit log: `{ timestamp, sessionId, toolKind, title, policy, outcome }`.
+
+---
+
+## Tool Calling (MCP Bridging)
+
+OpenAI tools defined in the `tools` array are bridged into the Antigravity ACP runtime using an ephemeral Model Context Protocol (MCP) TCP server (`--ide-mcp-port`):
+
+1. **Discovery & Registration:** When a chat request includes `tools`, the bridge registers them with the active ACP session.
+2. **Execution Pause:** When the agent invokes a bridged tool, the bridge pauses the ACP turn and yields an OpenAI response with `finish_reason: "tool_calls"` and `tool_calls: [...]`.
+3. **Continuation & Resume:** The client executes the function locally and submits the return value in a follow-up request with `role: "tool"` and matching `tool_call_id`. The bridge delivers the result back to the MCP socket, allowing the agent to complete its turn.
+4. **Lifecycle & TTL:** Unresolved tool calls expire after a 10-minute TTL.
+
+> **Note on Transcripts:** Per standard OpenAI specification, multi-turn conversations must pass the cumulative message history in chronological order (`[user, assistant (with tool_calls), tool (with tool_call_id)]`).
 
 ---
 

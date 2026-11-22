@@ -3,6 +3,7 @@ import { Transport } from "./transport.js";
 import { Connection } from "./connection.js";
 import { PermissionEngine } from "./permissions.js";
 import { Config } from "../config.js";
+import { McpBridgeServer } from "../mcp/server.js";
 
 export class Supervisor {
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -15,7 +16,8 @@ export class Supervisor {
   constructor(
     private readonly config: Config,
     private readonly command: string = config.agyBin,
-    private readonly args: string[] = ["acp"]
+    private readonly args: string[] = ["acp"],
+    public readonly mcpServer?: McpBridgeServer
   ) {
     this.permissionEngine = new PermissionEngine(config.permissionPolicy);
   }
@@ -38,7 +40,12 @@ export class Supervisor {
   }
 
   private spawnChild(): void {
-    this.child = spawn(this.command, this.args, {
+    const effectiveArgs = [...this.args];
+    if (this.mcpServer && this.mcpServer.getPort() > 0) {
+      effectiveArgs.push(`--ide-mcp-port=${this.mcpServer.getPort()}`);
+    }
+
+    this.child = spawn(this.command, effectiveArgs, {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env },
     });
@@ -50,7 +57,16 @@ export class Supervisor {
       },
       async (req) => {
         if (req.method === "session/request_permission") {
-          return this.permissionEngine.decide(req.params as any);
+          const params = req.params as any;
+          const toolTitle = params?.toolCall?.title || params?.toolCall?.kind || "";
+          const knownMcpTools = this.mcpServer?.getKnownToolNames(params?.sessionId) || [];
+          const isMcpTool = knownMcpTools.some(
+            (t) => toolTitle.includes(t) || params?.toolCall?.kind === t
+          );
+          if (isMcpTool) {
+            return this.permissionEngine.decide(params, "allow-all");
+          }
+          return this.permissionEngine.decide(params);
         }
         throw new Error(`Unsupported agent request method: ${req.method}`);
       }
