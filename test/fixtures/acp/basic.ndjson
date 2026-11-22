@@ -1,0 +1,5 @@
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"resume":true,"close":true,"load":true,"list":true,"additionalDirectories":true}},"authMethods":[{"id":"oauth-personal","name":"OAuth Personal"}]}}
+{"jsonrpc":"2.0","id":2,"result":{"sessionId":"conv-test-123","configOptions":[{"category":"model","currentValue":"gemini-3.8-flash","options":[{"value":"gemini-3.8-flash"},{"value":"gemini-3.8-pro"}]},{"category":"thought_level","currentValue":"high","options":[{"value":"low"},{"value":"medium"},{"value":"high"}]}]}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"conv-test-123","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"OK"}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"conv-test-123","update":{"sessionUpdate":"usage_update","used":17832,"size":1048576}}}
+{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","usage":{"inputTokens":17832,"outputTokens":1,"totalTokens":17833}}}
