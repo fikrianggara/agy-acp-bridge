@@ -9,6 +9,7 @@ import {
   stringifyMessageContent,
 } from "../mapping/request.js";
 import { mapFinishReason } from "../mapping/finish.js";
+import { handleStreamCompletion } from "./sse.js";
 
 export function createChatRouter(
   connection: Connection,
@@ -164,6 +165,21 @@ export function createChatRouter(
       c.header("x-acp-warnings", warnings.join(", "));
     }
     c.header("x-acp-session-id", session.sessionId);
+
+    // If stream = true
+    if (req.stream) {
+      return handleStreamCompletion(c, {
+        connection,
+        sessionId: session.sessionId,
+        model: req.model,
+        promptText,
+        includeUsage: req.stream_options?.include_usage ?? false,
+        exposeThoughts: config.exposeThoughts,
+        onEnd: async () => {
+          await connection.closeSession(session.sessionId).catch(() => {});
+        },
+      });
+    }
 
     // If stream = false (non-stream)
     const textChunks: string[] = [];
